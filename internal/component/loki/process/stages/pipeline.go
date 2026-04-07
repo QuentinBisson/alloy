@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
+	"github.com/alecthomas/units"
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -48,6 +50,68 @@ type StageConfig struct {
 	WindowsEventConfig           *WindowsEventConfig           `alloy:"windowsevent,block,optional"           json:"windowsevent,omitempty"`
 }
 
+// PodLogsDropConfig is the drop stage config for use in the PodLogs CRD.
+// It mirrors DropConfig but replaces OlderThan (time.Duration, which marshals
+// as a nanosecond int64 in JSON) with a human-readable duration string like
+// "5m" or "1h30s".
+type PodLogsDropConfig struct {
+	DropReason string           `json:"dropReason,omitempty"`
+	Source     string           `json:"source,omitempty"`
+	Value      string           `json:"value,omitempty"`
+	Separator  string           `json:"separator,omitempty"`
+	Expression string           `json:"expression,omitempty"`
+	OlderThan  string           `json:"olderThan,omitempty"` // human-readable duration e.g. "5m"
+	LongerThan units.Base2Bytes `json:"longerThan,omitempty"`
+}
+
+// toDropConfig converts a PodLogsDropConfig to DropConfig.
+// Returns an error if OlderThan is set but cannot be parsed as a duration.
+func (c *PodLogsDropConfig) toDropConfig() (DropConfig, error) {
+	cfg := DropConfig{
+		DropReason: c.DropReason,
+		Source:     c.Source,
+		Value:      c.Value,
+		Separator:  c.Separator,
+		Expression: c.Expression,
+		LongerThan: c.LongerThan,
+	}
+	if c.OlderThan != "" {
+		d, err := time.ParseDuration(c.OlderThan)
+		if err != nil {
+			return DropConfig{}, fmt.Errorf("invalid olderThan duration %q: %w", c.OlderThan, err)
+		}
+		cfg.OlderThan = d
+	}
+	return cfg, nil
+}
+
+// PodLogsMatchConfig is the match stage config for use in the PodLogs CRD.
+// It mirrors MatchConfig but uses PodLogsStageConfig for nested stages so that
+// incompatible stage types (multiline, windowsevent, eventlogmessage) are
+// excluded recursively.
+type PodLogsMatchConfig struct {
+	Selector     string               `json:"selector"`
+	Stages       []PodLogsStageConfig `json:"stages,omitempty"`
+	Action       string               `json:"action,omitempty"`
+	PipelineName string               `json:"pipelineName,omitempty"`
+	DropReason   string               `json:"dropReason,omitempty"`
+}
+
+// toMatchConfig converts a PodLogsMatchConfig to MatchConfig for use with newMatcherStage.
+func (c *PodLogsMatchConfig) toMatchConfig() (MatchConfig, error) {
+	converted, err := ConvertPodLogsStages(c.Stages)
+	if err != nil {
+		return MatchConfig{}, err
+	}
+	return MatchConfig{
+		Selector:     c.Selector,
+		Stages:       converted,
+		Action:       c.Action,
+		PipelineName: c.PipelineName,
+		DropReason:   c.DropReason,
+	}, nil
+}
+
 // PodLogsStageConfig defines a single processing stage for use in the PodLogs CRD.
 // It mirrors StageConfig but excludes stages that are incompatible with a shared
 // per-PodLogs pipeline:
@@ -58,7 +122,7 @@ type PodLogsStageConfig struct {
 	CRIConfig                    *CRIConfig                    `json:"cri,omitempty"`
 	DecolorizeConfig             *DecolorizeConfig             `json:"decolorize,omitempty"`
 	DockerConfig                 *DockerConfig                 `json:"docker,omitempty"`
-	DropConfig                   *DropConfig                   `json:"drop,omitempty"`
+	DropConfig                   *PodLogsDropConfig            `json:"drop,omitempty"`
 	GeoIPConfig                  *GeoIPConfig                  `json:"geoip,omitempty"`
 	JSONConfig                   *JSONConfig                   `json:"json,omitempty"`
 	LabelAllowConfig             *LabelAllowConfig             `json:"label_keep,omitempty"`
@@ -67,7 +131,7 @@ type PodLogsStageConfig struct {
 	LimitConfig                  *LimitConfig                  `json:"limit,omitempty"`
 	LogfmtConfig                 *LogfmtConfig                 `json:"logfmt,omitempty"`
 	LuhnFilterConfig             *LuhnFilterConfig             `json:"luhn,omitempty"`
-	MatchConfig                  *MatchConfig                  `json:"match,omitempty"`
+	MatchConfig                  *PodLogsMatchConfig           `json:"match,omitempty"`
 	MetricsConfig                *MetricsConfig                `json:"metrics,omitempty"`
 	OutputConfig                 *OutputConfig                 `json:"output,omitempty"`
 	PackConfig                   *PackConfig                   `json:"pack,omitempty"`
@@ -84,13 +148,31 @@ type PodLogsStageConfig struct {
 	TruncateConfig               *TruncateConfig               `json:"truncate,omitempty"`
 }
 
-// ToStageConfig converts a PodLogsStageConfig to the full StageConfig for use with NewPipeline.
-func (c PodLogsStageConfig) ToStageConfig() StageConfig {
+// ToStageConfig converts a PodLogsStageConfig to the full StageConfig for use
+// with NewPipeline. Returns an error if any field value is invalid (e.g. an
+// unparseable duration in a drop stage).
+func (c PodLogsStageConfig) ToStageConfig() (StageConfig, error) {
+	var dropConfig *DropConfig
+	if c.DropConfig != nil {
+		converted, err := c.DropConfig.toDropConfig()
+		if err != nil {
+			return StageConfig{}, err
+		}
+		dropConfig = &converted
+	}
+	var matchConfig *MatchConfig
+	if c.MatchConfig != nil {
+		converted, err := c.MatchConfig.toMatchConfig()
+		if err != nil {
+			return StageConfig{}, err
+		}
+		matchConfig = &converted
+	}
 	return StageConfig{
 		CRIConfig:                    c.CRIConfig,
 		DecolorizeConfig:             c.DecolorizeConfig,
 		DockerConfig:                 c.DockerConfig,
-		DropConfig:                   c.DropConfig,
+		DropConfig:                   dropConfig,
 		GeoIPConfig:                  c.GeoIPConfig,
 		JSONConfig:                   c.JSONConfig,
 		LabelAllowConfig:             c.LabelAllowConfig,
@@ -99,7 +181,7 @@ func (c PodLogsStageConfig) ToStageConfig() StageConfig {
 		LimitConfig:                  c.LimitConfig,
 		LogfmtConfig:                 c.LogfmtConfig,
 		LuhnFilterConfig:             c.LuhnFilterConfig,
-		MatchConfig:                  c.MatchConfig,
+		MatchConfig:                  matchConfig,
 		MetricsConfig:                c.MetricsConfig,
 		OutputConfig:                 c.OutputConfig,
 		PackConfig:                   c.PackConfig,
@@ -114,17 +196,21 @@ func (c PodLogsStageConfig) ToStageConfig() StageConfig {
 		TenantConfig:                 c.TenantConfig,
 		TimestampConfig:              c.TimestampConfig,
 		TruncateConfig:               c.TruncateConfig,
-	}
+	}, nil
 }
 
 // ConvertPodLogsStages converts a slice of PodLogsStageConfig to []StageConfig
 // for use with NewPipeline.
-func ConvertPodLogsStages(in []PodLogsStageConfig) []StageConfig {
+func ConvertPodLogsStages(in []PodLogsStageConfig) ([]StageConfig, error) {
 	out := make([]StageConfig, len(in))
 	for i, s := range in {
-		out[i] = s.ToStageConfig()
+		converted, err := s.ToStageConfig()
+		if err != nil {
+			return nil, err
+		}
+		out[i] = converted
 	}
-	return out
+	return out, nil
 }
 
 // Pipeline pass down a log entry to each stage for mutation and/or label extraction.
@@ -149,6 +235,109 @@ func NewPipeline(logger log.Logger, stages []StageConfig, registerer prometheus.
 		stages:    st,
 		dropCount: getDropCountMetric(registerer),
 	}, nil
+}
+
+// syncChecker is an optional interface that stages with nested pipelines (e.g.
+// matcherStage) can implement to report whether their internal pipeline also
+// supports synchronous processing. Pipeline.CanProcessSync checks this in
+// addition to the SyncStage interface so that a match stage with a non-sync
+// inner pipeline does not falsely advertise sync capability.
+type syncChecker interface {
+	canProcessSync() bool
+}
+
+// CanProcessSync returns true when every stage in the pipeline implements
+// SyncStage and, for stages with nested pipelines (match), that nested pipeline
+// also supports synchronous processing.
+func (p *Pipeline) CanProcessSync() bool {
+	for _, s := range p.stages {
+		if _, ok := s.(SyncStage); !ok {
+			return false
+		}
+		if sc, ok := s.(syncChecker); ok && !sc.canProcessSync() {
+			return false
+		}
+	}
+	return true
+}
+
+// processEntryFull applies all pipeline stages to an already-initialized Entry,
+// preserving the existing Extracted map. This is the inner loop used by
+// ProcessEntry and by matcherStage.ProcessEntry for nested pipelines; it does
+// NOT reinitialize Extracted from labels (unlike the public ProcessEntry).
+// All stages must implement SyncStage; callers are responsible for ensuring
+// CanProcessSync() is true before calling this method.
+func (p *Pipeline) processEntryFull(e Entry) []Entry {
+	entries := []Entry{e}
+	for _, stage := range p.stages {
+		if len(entries) == 0 {
+			break
+		}
+		ss := stage.(SyncStage) // safe: caller guarantees CanProcessSync
+		var next []Entry
+		for _, entry := range entries {
+			next = append(next, ss.ProcessEntry(entry)...)
+		}
+		entries = next
+	}
+	return entries
+}
+
+// ProcessEntry applies all stages to a single entry synchronously.
+// The pipeline must support synchronous processing (CanProcessSync() == true).
+// It initialises the Extracted map from the entry labels, applies each stage in
+// order, and returns the resulting entries (empty = dropped, multiple = expanded).
+func (p *Pipeline) ProcessEntry(e loki.Entry) []loki.Entry {
+	inner := Entry{
+		Extracted: make(map[string]any, len(e.Labels)),
+		Entry:     e,
+	}
+	for k, v := range e.Labels {
+		inner.Extracted[string(k)] = string(v)
+	}
+
+	processed := p.processEntryFull(inner)
+
+	result := make([]loki.Entry, len(processed))
+	for i, entry := range processed {
+		result[i] = entry.Entry
+	}
+	return result
+}
+
+// StartSync starts the pipeline using a single goroutine instead of the N+3
+// goroutine chain produced by Start. It requires CanProcessSync() == true.
+//
+// Resource usage comparison (N = number of stages):
+//
+//	Start:     N+3 goroutines (1 label-init RunWith + 1 per stage + 2 adapters)
+//	StartSync: 1 goroutine
+func (p *Pipeline) StartSync(in chan loki.Entry, out chan<- loki.Entry) loki.EntryHandler {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var (
+		wg   sync.WaitGroup
+		once sync.Once
+	)
+
+	wg.Go(func() {
+		defer p.Cleanup()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case e := <-in:
+				for _, result := range p.ProcessEntry(e) {
+					out <- result
+				}
+			}
+		}
+	})
+
+	return loki.NewEntryHandler(in, func() {
+		once.Do(func() { cancel() })
+		wg.Wait()
+	})
 }
 
 // Start will start the pipeline and forward entries to next.

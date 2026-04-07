@@ -165,3 +165,32 @@ func (s *structuredMetadataStage) extractFromLabels(e Entry) Entry {
 	e.Labels = labels
 	return e
 }
+
+// ProcessEntry implements SyncStage.
+func (s *structuredMetadataStage) ProcessEntry(e Entry) []Entry {
+	processLabelsConfigs(s.logger, e.Extracted, s.labelsConfig, func(labelName model.LabelName, labelValue model.LabelValue) {
+		e.StructuredMetadata = append(e.StructuredMetadata, push.LabelAdapter{Name: string(labelName), Value: string(labelValue)})
+	})
+	if s.regex.String() != "" {
+		for lName, lValue := range e.Extracted {
+			if s.regex.MatchString(lName) {
+				str, err := getString(lValue)
+				if err != nil {
+					if Debug {
+						level.Debug(s.logger).Log("msg", "failed to convert extracted label value to string", "err", err, "type", reflect.TypeOf(lValue))
+					}
+					continue
+				}
+				labelValue := model.LabelValue(str)
+				if !labelValue.IsValid() {
+					if Debug {
+						level.Debug(s.logger).Log("msg", "invalid label value parsed", "value", labelValue)
+					}
+					continue
+				}
+				e.StructuredMetadata = append(e.StructuredMetadata, push.LabelAdapter{Name: lName, Value: string(labelValue)})
+			}
+		}
+	}
+	return []Entry{s.extractFromLabels(e)}
+}

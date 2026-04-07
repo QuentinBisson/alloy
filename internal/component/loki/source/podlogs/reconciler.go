@@ -478,17 +478,25 @@ func (r *reconciler) ensurePipeline(key string, stageConfigs []stages.PodLogsSta
 		"podlogs_name":      name,
 	}, r.registerer)
 
-	pipeline, err := stages.NewPipeline(r.log, stages.ConvertPodLogsStages(stageConfigs), pipelineRegisterer, r.minStability)
+	converted, err := stages.ConvertPodLogsStages(stageConfigs)
+	if err != nil {
+		return nil, err
+	}
+	pipeline, err := stages.NewPipeline(r.log, converted, pipelineRegisterer, r.minStability)
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO: Pipeline.Start spawns N_stages+3 goroutines per PodLogs resource.
-	// At large scale (hundreds of PodLogs with stages) this adds up. A future
-	// improvement would be to add a synchronous Pipeline.Process(entry) path so
-	// stages can be applied inline inside each tailer goroutine (zero overhead).
+	// Use StartSync (1 goroutine) when all stages implement SyncStage.
+	// Fall back to Start (N+3 goroutines) only for pipelines containing
+	// stages that don't yet support synchronous processing (e.g. match).
 	pipelineIn := loki.NewLogsReceiver()
-	entryHandler := pipeline.Start(pipelineIn.Chan(), r.mainOutChan)
+	var entryHandler loki.EntryHandler
+	if pipeline.CanProcessSync() {
+		entryHandler = pipeline.StartSync(pipelineIn.Chan(), r.mainOutChan)
+	} else {
+		entryHandler = pipeline.Start(pipelineIn.Chan(), r.mainOutChan)
+	}
 
 	r.pipelines[key] = &managedPipeline{
 		entryHandler: entryHandler,
